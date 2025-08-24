@@ -1,0 +1,95 @@
+## 🎯 Contexto
+
+O objetivo do Case 5 foi **investigar causalmente** se **mudanças de perfil comportamental** (detectadas no tracking probabilístico + clusterização) **impactam variáveis de negócio** como ticket médio, frequência de compra e outros KPIs.
+Ou seja: **quando o cliente muda de perfil, há um efeito causal subsequente sobre seu comportamento de compra?**
+
+
+## 🔑 Outputs Produzidos
+
+1. **Painel Temporal Longitudinal** (`df_all` + `panel`)
+
+   * Cada cliente observado ao longo do tempo, com:
+
+     * Perfil estimado por janela
+     * Probabilidades de cada perfil
+     * Outcomes agregados (ticket médio, frequência total etc.)
+     * Identificação de janelas pré e pós-mudança de perfil
+       👉 Estrutura típica de *event study* / *panel data*.
+
+2. **Event Study Estimado (coeficientes de k)**
+
+   * Estimativas dos efeitos **mês a mês** relativos à mudança de perfil.
+   * Com intervalos de confiança → robustez estatística.
+   * Permite ver **antecipação** (k<0), **impacto imediato** (k=0, k=1), e **persistência/decadência** (k>0).
+
+3. **Análise de Estabilidade** (`df_stability`)
+
+   * Mede se a mudança de perfil foi episódica ou sustentada.
+   * Permite diferenciar clientes “oscilantes” de clientes em “transição estrutural”.
+
+4. **Resumo Final por Cliente** (`df_final`)
+
+   * Perfil dominante
+   * Entropia média (incerteza das probabilidades de perfil)
+   * Número de transições
+   * Probabilidades médias por perfil
+     👉 Útil para segmentação prescritiva e monitoramento de risco.
+
+5. **Modelos de Uplift** (opcional)
+
+   * Identificam quais clientes apresentam **maior efeito esperado** após mudança de perfil.
+   * Permite priorizar campanhas de retenção ou *cross-sell*.
+
+
+## 📈 Projeções de Cenários com os Outputs
+
+Com base nesses outputs, conseguimos projetar cenários **descritivos, preditivos e prescritivos**:
+
+### 1. **Descritivo & Diagnóstico**
+
+* Mapear quantos clientes **mudam de perfil** por período.
+* Identificar quais perfis têm **maior propensão a transição**.
+* Avaliar se mudanças se concentram em determinados produtos, categorias ou sazonalidades.
+
+### 2. **Causal (Impacto de Mudança)**
+
+* **Ticket médio pós-mudança**: quantificar o efeito em R\$ comparado ao baseline.
+  Ex.: “Mudança de perfil 2→3 aumenta em +12% o ticket médio em até 3 meses.”
+* **Frequência de compra**: medir se há redução ou aumento de visitas.
+  Ex.: “Clientes que migram para o perfil de **alta frequência/baixo ticket** aumentam em 2 compras/mês.”
+
+### 3. **Preditivo**
+
+* Com base no histórico + outputs de entropia e transições, projetar **quais clientes devem mudar de perfil nos próximos meses**.
+* Antecipar mudanças negativas (migração para perfil de baixo valor) e intervir.
+
+### 4. **Prescritivo**
+
+* Usando o **uplift model**, priorizar **ações direcionadas**:
+
+  * Se o uplift previsto para ticket médio > 0 → direcionar campanha de *cross-sell*.
+  * Se o uplift < 0 → acionar time de retenção antes da perda de valor.
+* Definir **estratégia de marketing diferenciada por perfil**: ex. clientes “oscilantes” recebem incentivo de fidelidade.
+
+### 5. **Cenários de Simulação**
+
+* **What-if**: “Se 15% dos clientes migrarem do perfil 1 → perfil 3, qual o impacto esperado no faturamento mensal?”
+* Integração com planejamento de demanda: projetar estoques e margens com base em padrões de transição causal.
+
+
+## 🚀 Conclusão Estratégica
+
+O Case 5 não apenas **mede correlação**, mas **traz evidências causais** de como **mudanças de perfil impactam métricas-chave de negócio ao longo do tempo**.
+
+Isso permite:
+
+* **Explicabilidade**: entender o “porquê” da mudança de comportamento.
+* **Previsão confiável**: antecipar tendências baseadas em comportamento causal, não só em regressões.
+* **Decisão prescritiva**: agir seletivamente sobre clientes com maior risco/oportunidade, maximizando ROI de campanhas.
+
+
+👉 Em resumo: **os outputs do Case 5 fornecem base robusta para monitorar, prever e influenciar o comportamento do cliente com evidência causal**, fechando o ciclo completo de análises descritivas → diagnósticas → preditivas → prescritivas.
+
+---
+
+Quer que eu prepare uma **versão executiva visual (slide)** desses cenários projetados — com fluxos, gráficos de impacto causal e roadmap prescritivo — para que você use diretamente em uma apresentação para liderança?
