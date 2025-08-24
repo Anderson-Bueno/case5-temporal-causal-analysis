@@ -1,0 +1,15 @@
+O Problema Resolvido
+
+Desafio de negócio: empresas segmentam clientes em perfis (clusters, scores etc.), mas não sabem se a mudança de perfil causa impacto real no comportamento de compra.
+
+Exemplo: um cliente muda de “Explorador” para “Elaborador”. Será que essa mudança provoca aumento no ticket/frequência, ou é apenas correlação natural da base?
+
+Risco:
+
+Tomar decisões de marketing/CRM baseadas em correlação.
+
+Investir em campanhas para “induzir mudança de perfil” sem prova de que isso gera ROI.
+
+Relatórios bonitos de segmentação, mas sem conexão causal com resultado.
+
+Problema central: falta de evidência causal sobre os efeitos da mudança de perfil no comportamento de compra.
