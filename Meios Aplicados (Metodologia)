@@ -1,0 +1,27 @@
+Para atacar esse problema, a publicação mostra como usamos técnicas de inferência causal aplicadas a séries temporais sobre o arcabouço já construído (tracking, matching probabilístico, estabilidade):
+
+Construção do painel temporal
+
+Base: df_all (tracking de perfis mês a mês).
+
+Detectar primeira mudança de perfil → tratada como evento de tratamento.
+
+Criar variáveis de “tempo relativo ao evento” (event_time).
+
+Event Study / DiD escalonado
+
+Regressão com dummies de tempo de evento para estimar efeito médio da mudança em ticket/frequência.
+
+Validações: pré-tendências (~0 antes do evento), placebos, janelas de sensibilidade.
+
+Heterogeneidade de efeito (Uplift)
+
+Causal Forest ou Random Forest Regressor sobre o delta pré/pós para identificar quem mais captura valor.
+
+Permite ao negócio priorizar segmentos com maior ROI.
+
+Resultados esperados
+
+Gráfico de pré-tendência → prova de que o efeito aparece somente após o tratamento.
+
+Tabela de uplift → mostra top clientes/segmentos em que a mudança de perfil realmente causa impacto positivo.
