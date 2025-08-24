@@ -1,0 +1,667 @@
+# ============================================
+# 📓 Case 5 — Análise Causal Temporal em Séries
+# ============================================
+
+# =========================
+# 0) Parâmetros do Notebook
+# =========================
+DBFS_PARQUET_PATH = "dbfs:/FileStore/shared_uploads/data.parquet"
+CLIENTE_ID_COL     = "idcliente"
+DATA_COL           = "dataconsumo"
+QTD_COL            = "quantidade"
+VALOR_COL          = "valorunitario"
+PRODUTO_COL        = "produto"
+
+# Janelas/Outcome para causal
+MONTHS_PER_WINDOW  = 1
+OUTCOMES_FOR_CAUSAL = ["ticket_medio", "frequencia_total"]  # use o que fizer sentido
+EVENT_WINDOW       = (-6, 6)  # k de -6 a +6 meses, baseline = -1
+BASELINE_K         = -1
+
+# =========================
+# 1) Setup & Imports
+# =========================
+import sys
+sys.path.append("/Workspace/Users/")
+
+import os
+import datetime
+import logging
+import numpy as np
+import pandas as pd
+
+from pyspark.sql import DataFrame
+from pyspark.sql import functions as F
+from pyspark.sql.types import DateType, TimestampType, StringType
+from pyspark.sql.functions import (
+    col, lit, mean, stddev, count, min, max, exp, log1p, pow, datediff, current_date, to_date, to_timestamp
+)
+
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import (
+    classification_report, cohen_kappa_score, precision_score, recall_score, f1_score, confusion_matrix
+)
+from sklearn.covariance import MinCovDet
+from sklearn.decomposition import PCA
+from sklearn.cluster import KMeans
+from scipy.spatial import distance
+from scipy.spatial.distance import jensenshannon
+from scipy.stats import zscore, skew, kurtosis, entropy
+from dateutil.relativedelta import relativedelta
+
+# Tenta statsmodels (Event Study com FE). Se não houver, fallback depois.
+try:
+    import statsmodels.api as sm
+    import statsmodels.formula.api as smf
+    _HAVE_STATSMODELS = True
+except Exception:
+    _HAVE_STATSMODELS = False
+
+# Importa funções do pipeline atualizado (seu módulo local)
+from pipeline_preprocessing import (
+    prepare_input_layers,
+    calculateAttributes_v4  # definida no módulo do usuário
+)
+
+# =========================
+# 2) Logging
+# =========================
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("case5-causal")
+
+# =========================
+# 3) Utilidades (Datas, Diagnóstico, Validação)
+# =========================
+def print_df_diagnostics(df: DataFrame, spark_obj_name: str = "df"):
+    try:
+        total = df.count()
+        logger.info(f"[INFO] Total de linhas em {spark_obj_name}: {total}")
+        logger.info(f"[INFO] Schema de {spark_obj_name}:")
+        df.printSchema()
+        logger.info(f"[INFO] 5 primeiras linhas de {spark_obj_name}:")
+        df.show(5, truncate=False)
+    except Exception as e:
+        logger.error(f"[ERRO] ao inspecionar {spark_obj_name}: {e}")
+
+def safe_date_extraction(dt):
+    """
+    Converte valores diversos para datetime.date, tolerando strings com horário
+    ('YYYY-MM-DD HH:MM:SS.sss', ISO, etc.).
+    """
+    if isinstance(dt, datetime.datetime):
+        return dt.date()
+    if isinstance(dt, datetime.date):
+        return dt
+    if isinstance(dt, str):
+        # Tenta parsing robusto
+        try:
+            return pd.to_datetime(dt, errors="raise").date()
+        except Exception:
+            # fallback: usa só a parte da data
+            base = dt.split("T")[0].split(" ")[0]
+            return datetime.datetime.strptime(base, "%Y-%m-%d").date()
+    raise TypeError(f"Tipo não suportado para data: {type(dt)}")
+
+def ensure_date_column(sdf: DataFrame, colname: str) -> DataFrame:
+    """
+    Garante que a coluna seja do tipo DateType no Spark (sem hora).
+    """
+    dtype = [f.dataType for f in sdf.schema.fields if f.name == colname]
+    if not dtype:
+        raise ValueError(f"Coluna {colname} não encontrada.")
+    dtype = dtype[0]
+
+    if isinstance(dtype, DateType):
+        return sdf
+
+    # Se for timestamp -> to_date
+    if isinstance(dtype, TimestampType):
+        return sdf.withColumn(colname, to_date(col(colname)))
+
+    # Se for string -> tenta to_date direto; se virar muitos nulls, tenta to_timestamp e então to_date
+    if isinstance(dtype, StringType):
+        tmp = sdf.withColumn(colname, to_date(col(colname)))
+        nulls = tmp.filter(col(colname).isNull()).count()
+        total = sdf.count()
+        if total > 0 and nulls / total > 0.25:  # heurística: muitos nulls => tentar timestamp
+            tmp = sdf.withColumn(colname, to_date(to_timestamp(col(colname))))
+        return tmp
+
+    # Qualquer outro tipo: tenta cast para date
+    return sdf.withColumn(colname, to_date(col(colname)))
+
+def spark_date_min_max(sdf: DataFrame, colname: str):
+    """
+    Min / Max seguros para coluna de data no Spark -> datetime.date em Python.
+    """
+    row = sdf.select(F.min(col(colname)).alias("min_d"), F.max(col(colname)).alias("max_d")).first()
+    if row is None:
+        raise ValueError("DataFrame vazio para min/max.")
+    return safe_date_extraction(row["min_d"]), safe_date_extraction(row["max_d"])
+
+def validate_input_dataframe(df: DataFrame, required_columns: list) -> None:
+    """
+    Validação leve: colunas obrigatórias, nulos, outliers e drift simples (JS).
+    """
+    missing = [c for c in required_columns if c not in df.columns]
+    if missing:
+        raise ValueError(f"Colunas ausentes: {missing}")
+
+    sample = df.limit(2000).toPandas()
+    null_ratios = sample.isnull().mean()
+    logger.info("[VALIDAÇÃO] % nulos por coluna (amostra):")
+    nz = null_ratios[null_ratios > 0].round(3)
+    if len(nz):
+        logger.info(nz.to_string())
+    else:
+        logger.info("Sem nulos na amostra.")
+
+    numeric_cols = sample.select_dtypes(include=[np.number]).columns
+    if len(numeric_cols):
+        zscores = np.abs(zscore(sample[numeric_cols], nan_policy='omit'))
+        outlier_count = (zscores > 3).sum(axis=0)
+        logger.info("[VALIDAÇÃO] Outliers por coluna numérica (amostra):")
+        logger.info(dict(zip(numeric_cols, outlier_count)))
+
+        logger.info("[VALIDAÇÃO] Drift simples (JS) em numéricos, amostra dividida ao meio:")
+        for col_name in numeric_cols:
+            series = sample[col_name].dropna()
+            if len(series) < 40:
+                continue
+            midpoint = len(series) // 2
+            dist1 = np.histogram(series[:midpoint], bins=10, density=True)[0] + 1e-9
+            dist2 = np.histogram(series[midpoint:], bins=10, density=True)[0] + 1e-9
+            js_div = jensenshannon(dist1, dist2)
+            logger.info(f"→ {col_name}: JS = {round(float(js_div), 3)}")
+
+
+# =========================
+# 4) Funções Auxiliares de Feature/Modelagem
+# =========================
+def choose_n_components(X: pd.DataFrame, threshold: float = 0.95) -> int:
+    pca_temp = PCA(n_components=min(X.shape[1], X.shape[0]))
+    pca_temp.fit(X)
+    cumulative_variance = np.cumsum(pca_temp.explained_variance_ratio_)
+    return int(np.argmax(cumulative_variance >= threshold) + 1)
+
+def calculate_weight_score_v2(df_features: pd.DataFrame, variance_threshold: float = 0.95) -> tuple:
+    df_out = df_features.copy()
+    feature_cols = [c for c in df_out.columns if c != CLIENTE_ID_COL]
+    X = df_out[feature_cols].values
+
+    stats = {
+        "variavel": feature_cols,
+        "skewness": [float(skew(X[:, i])) for i in range(X.shape[1])],
+        "kurtosis": [float(kurtosis(X[:, i])) for i in range(X.shape[1])]
+    }
+    df_stats = pd.DataFrame(stats)
+
+    pca = PCA(n_components=choose_n_components(pd.DataFrame(X, columns=feature_cols), threshold=variance_threshold))
+    X_pca = pca.fit_transform(X)
+    df_out["pca_score"] = X_pca[:, 0]
+    return df_out[[CLIENTE_ID_COL, "pca_score"]], df_stats
+
+def calculateProbabilisticProfiles(df_features: pd.DataFrame,
+                                   perfil_centroids: pd.DataFrame,
+                                   robust: bool = True,
+                                   regularization_epsilon: float = 1e-3,
+                                   alpha: float = 1.0) -> pd.DataFrame:
+    feature_cols = [c for c in df_features.columns if c != CLIENTE_ID_COL]
+    X = df_features[feature_cols].values
+
+    try:
+        if robust:
+            mcd = MinCovDet().fit(X)
+            cov = mcd.covariance_
+        else:
+            cov = np.cov(X.T)
+        cov = cov + np.eye(cov.shape[0]) * regularization_epsilon
+        cov_inv = np.linalg.inv(cov)
+    except Exception:
+        logger.warning("[AVISO] Fallback p/ distância Euclidiana (cov não invertível).")
+        cov_inv = None
+
+    results = []
+    for _, row in df_features.iterrows():
+        cliente_id = row[CLIENTE_ID_COL]
+        x = row[feature_cols].values.astype(float)
+
+        dists = []
+        for perfil in perfil_centroids.index:
+            mu = perfil_centroids.loc[perfil].values.astype(float)
+            try:
+                dist = distance.mahalanobis(x, mu, cov_inv) if cov_inv is not None else np.linalg.norm(x - mu)
+            except Exception:
+                dist = np.linalg.norm(x - mu)
+            dists.append((perfil, float(dist)))
+
+        d_array = np.array([d for _, d in dists])
+        scores = np.exp(-alpha * d_array)
+        probs = scores / scores.sum()
+
+        result = {CLIENTE_ID_COL: cliente_id, "perfil_estimado": dists[np.argmin(d_array)][0]}
+        for i, (perfil, _) in enumerate(dists):
+            result[f"prob_{perfil}"] = float(probs[i])
+        results.append(result)
+
+    return pd.DataFrame(results)
+
+def cluster_dynamic_profiles(df_features: pd.DataFrame, n_clusters: int = 5) -> pd.DataFrame:
+    features = df_features.drop(columns=[CLIENTE_ID_COL])
+    pca = PCA(n_components=3)
+    reduced = pca.fit_transform(features)
+    kmeans = KMeans(n_clusters=n_clusters, random_state=42)
+    clusters = kmeans.fit_predict(reduced)
+    df_result = df_features[[CLIENTE_ID_COL]].copy()
+    df_result["perfil_clusterizado"] = clusters
+    return df_result
+
+def analyze_profile_stability(df_all: pd.DataFrame) -> pd.DataFrame:
+    df_all_sorted = df_all.sort_values(by=[CLIENTE_ID_COL, "janela_inicio"])
+    summary = []
+    for cliente_id, group in df_all_sorted.groupby(CLIENTE_ID_COL):
+        perfis = group["perfil_estimado"].tolist()
+        transicoes = sum([1 for i in range(1, len(perfis)) if perfis[i] != perfis[i - 1]])
+        perfil_dominante = max(set(perfis), key=perfis.count)
+        estabilidade = perfis.count(perfil_dominante) / len(perfis)
+        summary.append({
+            CLIENTE_ID_COL: cliente_id,
+            "perfil_dominante": perfil_dominante,
+            "qtd_transicoes": transicoes,
+            "estabilidade_percentual": round(estabilidade * 100, 2)
+        })
+    return pd.DataFrame(summary)
+
+def resumir_perfil_cliente(group: pd.DataFrame, cliente_id: str) -> dict:
+    perfis = group["perfil_estimado"].tolist()
+    perfil_dominante = max(set(perfis), key=perfis.count)
+    transicoes = sum([1 for i in range(1, len(perfis)) if perfis[i] != perfis[i - 1]])
+    jaccard = len(set(perfis)) / len(perfis) if len(perfis) > 0 else 0
+    prob_cols = [c for c in group.columns if c.startswith("prob_")]
+    prob_means = group[prob_cols].mean().to_dict() if len(prob_cols) else {}
+    entropias = group[prob_cols].apply(lambda row: entropy(row + 1e-9), axis=1) if len(prob_cols) else pd.Series([0])
+    entropia_media = entropias.mean() if len(entropias) else 0.0
+
+    row = {
+        CLIENTE_ID_COL: cliente_id,
+        "perfil_final": perfil_dominante,
+        "qtd_transicoes": transicoes,
+        "jaccard_estabilidade": round(jaccard, 3),
+        "entropia_media": round(float(entropia_media), 3)
+    }
+    row.update({f"media_{k}": round(float(v), 3) for k, v in prob_means.items()})
+    return row
+
+def generate_time_windows(start_date: datetime.date, end_date: datetime.date, months_per_window: int = 1):
+    windows = []
+    current_end = end_date
+    while current_end > start_date:
+        current_start = current_end - relativedelta(months=months_per_window)
+        windows.append((current_start, current_end))
+        current_end = current_start
+    return list(reversed(windows))
+
+def save_outputs_to_parquet(df_all: pd.DataFrame, df_stability: pd.DataFrame, df_final: pd.DataFrame, path: str):
+    os.makedirs(path, exist_ok=True)
+    df_all.to_parquet(f"{path}/df_all.parquet", index=False)
+    df_stability.to_parquet(f"{path}/df_stability.parquet", index=False)
+    df_final.to_parquet(f"{path}/df_final.parquet", index=False)
+    print(f"[OUTPUT] Dados salvos em: {path}")
+
+def supervised_profile_classifier(X_df: pd.DataFrame, target_df: pd.DataFrame):
+    if "perfil_final" not in target_df.columns:
+        logger.warning("[SUPERVISIONADO] 'perfil_final' não disponível; pulando treino.")
+        return
+    df = X_df.merge(target_df[[CLIENTE_ID_COL, "perfil_final"]], on=CLIENTE_ID_COL, how="inner")
+    if df.empty:
+        logger.warning("[SUPERVISIONADO] Sem amostras após merge; pulando treino.")
+        return
+    X = df.drop(columns=[CLIENTE_ID_COL, "perfil_final"])
+    y = df["perfil_final"]
+    if X.empty:
+        logger.warning("[SUPERVISIONADO] Sem features; pulando treino.")
+        return
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    clf = RandomForestClassifier(n_estimators=200, random_state=42)
+    clf.fit(X_train, y_train)
+    y_pred = clf.predict(X_test)
+    logger.info("\n[SUPERVISIONADO] Classification Report:")
+    logger.info("\n" + classification_report(y_test, y_pred))
+    logger.info(f"Cohen Kappa: {round(cohen_kappa_score(y_test, y_pred), 3)}")
+    logger.info(f"Precision: {round(precision_score(y_test, y_pred, average='macro'), 3)}")
+    logger.info(f"Recall: {round(recall_score(y_test, y_pred, average='macro'), 3)}")
+    logger.info(f"F1 Score: {round(f1_score(y_test, y_pred, average='macro'), 3)}")
+    logger.info(f"\nConfusion Matrix:\n{confusion_matrix(y_test, y_pred)}")
+
+
+# =========================
+# 5) Tracking Temporal (aproveita pipeline)
+# =========================
+def track_profiles_over_time(
+    spark_df: DataFrame,
+    numerical_cols,
+    categorical_cols,
+    raw_cols,
+    perfil_centroids: pd.DataFrame,
+    cliente_id_col=CLIENTE_ID_COL,
+    data_col=DATA_COL,
+    months_per_window=1
+):
+    # Validação + garantia de tipo date
+    validate_input_dataframe(spark_df, required_columns=list(set(numerical_cols + categorical_cols + raw_cols)))
+    sdf = ensure_date_column(spark_df, data_col)
+
+    # Camadas do pipeline (usuário)
+    df_model_input, df_model_staging = prepare_input_layers(sdf, numerical_cols, categorical_cols, raw_cols)
+
+    # Janela temporal (seguro)
+    min_date, max_date = spark_date_min_max(df_model_staging, data_col)
+    time_windows = generate_time_windows(min_date, max_date, months_per_window)
+    logger.info(f"[DEBUG] janelas: {time_windows[0]} ... {time_windows[-1]} (total={len(time_windows)})")
+
+    results = []
+    last_df_score = None
+    last_df_cluster = None
+
+    for start, end in time_windows:
+        logger.info(f"[INFO] Janela: {start} → {end}")
+        df_window = df_model_staging.filter((col(data_col) >= lit(str(start))) & (col(data_col) < lit(str(end))))
+        if df_window.count() == 0:
+            continue
+
+        # Atributos v4 (Spark) -> Pandas
+        df_features_spark = calculateAttributes_v4(
+            df_window,
+            cliente_id_col=cliente_id_col,
+            data_col=data_col,
+            qtd_col=QTD_COL,
+            valor_col=VALOR_COL,
+            produto_col=PRODUTO_COL
+        )
+        df_features_pd = df_features_spark.toPandas()
+
+        # Scoring, matching, cluster
+        df_score, _ = calculate_weight_score_v2(df_features_pd)
+        df_prob = calculateProbabilisticProfiles(df_features_pd, perfil_centroids)
+        df_cluster = cluster_dynamic_profiles(df_features_pd.drop(columns=[], errors="ignore"))  # cluster só de features
+
+        # Painel temporal
+        df_prob["janela_inicio"] = pd.Timestamp(start)
+        df_prob["janela_fim"]    = pd.Timestamp(end)
+
+        # >>>> Adiciona MÉTRICAS de outcome para causal (ex: ticket_medio, frequencia_total etc.)
+        # Junta features agregadas desta janela ao painel probabilístico
+        outcomes_cols = [c for c in df_features_pd.columns if c != cliente_id_col]
+        df_join = df_prob.merge(
+            df_features_pd[[cliente_id_col] + outcomes_cols],
+            on=cliente_id_col,
+            how="left",
+            suffixes=("", "_feat")
+        )
+
+        # Junta cluster e score
+        df_join = df_join.merge(df_cluster, on=cliente_id_col, how="left")
+        df_join = df_join.merge(df_score, on=cliente_id_col, how="left")
+
+        results.append(df_join)
+        last_df_score = df_score
+        last_df_cluster = df_cluster
+
+    if not results:
+        logger.warning("[AVISO] Sem resultados (verifique janelas/dados).")
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    # Consolidação
+    df_all = pd.concat(results, ignore_index=True)
+    df_stability = analyze_profile_stability(df_all)
+    df_final = pd.DataFrame([
+        resumir_perfil_cliente(group, cliente_id)
+        for cliente_id, group in df_all.sort_values(by=[cliente_id_col, "janela_inicio"]).groupby(cliente_id_col)
+    ])
+
+    # Opcional: executor supervisionado
+    if last_df_score is not None and last_df_cluster is not None and not df_final.empty:
+        df_features_union = pd.concat([last_df_score, last_df_cluster], axis=1).drop_duplicates(cliente_id_col)
+        supervised_profile_classifier(df_features_union, df_final)
+
+    return df_all, df_stability, df_final
+
+
+# =========================
+# 6) Leitura & Preparação
+# =========================
+# Lê parquet do DBFS
+raw_df = spark.read.parquet(DBFS_PARQUET_PATH)
+
+# Garante coluna de data como DateType
+raw_df = ensure_date_column(raw_df, DATA_COL)
+
+# Diagnóstico
+print_df_diagnostics(raw_df, "raw_df")
+
+# Colunas
+numerical_cols = [QTD_COL, VALOR_COL]
+categorical_cols = [PRODUTO_COL]
+raw_cols = [CLIENTE_ID_COL, DATA_COL, QTD_COL, VALOR_COL, PRODUTO_COL]
+
+# Centroides temporários (exemplo; ajuste conforme seu clustering)
+perfil_centroids = pd.DataFrame({
+    "frequencia_total":       [1,   10],
+    "ticket_medio":           [10., 100.],
+    "quantidade_media":       [1.,  5.],
+    "ticket_std":             [5.,  20.],
+    "quantidade_std":         [0.5, 3.0],
+    "recencia_exponencial":   [0.1, 0.9],
+    "tempo_ultima_compra_dias":[200, 5],
+    "ticket_log_medio":       [2.3, 4.5],
+    "quantidade_log_media":   [0.7, 1.6],
+    "qtd_quadrado_medio":     [1.5, 25.0]
+}, index=["perfil_1", "perfil_2"])
+
+# =========================
+# 7) Execução do Tracking
+# =========================
+df_all, df_stability, df_final = track_profiles_over_time(
+    spark_df=raw_df,
+    numerical_cols=numerical_cols,
+    categorical_cols=categorical_cols,
+    raw_cols=raw_cols,
+    perfil_centroids=perfil_centroids,
+    cliente_id_col=CLIENTE_ID_COL,
+    data_col=DATA_COL,
+    months_per_window=MONTHS_PER_WINDOW
+)
+
+logger.info(f"[OK] df_all: {df_all.shape}, df_stability: {df_stability.shape}, df_final: {df_final.shape}")
+
+# =========================
+# 8) Construção do Painel p/ Causal (Event Study)
+# =========================
+def build_event_study_panel(df_all: pd.DataFrame,
+                            id_col=CLIENTE_ID_COL,
+                            perfil_col="perfil_estimado",
+                            time_col="janela_inicio",
+                            outcomes=OUTCOMES_FOR_CAUSAL,
+                            k_window=EVENT_WINDOW):
+    """
+    - Detecta primeira mudança de perfil por cliente => tempo de tratamento (t0)
+    - Calcula event_time k (mês relativo a t0) e restringe à janela k_window
+    - Retorna painel filtrado para tratados + com outcomes
+    """
+    if df_all.empty:
+        raise ValueError("df_all vazio. Rode o tracking primeiro.")
+
+    df = df_all.copy()
+    # Garante datetime no tempo
+    df[time_col] = pd.to_datetime(df[time_col])
+
+    # Ordena e detecta mudança
+    df = df.sort_values([id_col, time_col])
+    df["perfil_prev"] = df.groupby(id_col)[perfil_col].shift(1)
+    df["mudou_perfil"] = (df[perfil_col] != df["perfil_prev"]) & df["perfil_prev"].notna()
+
+    # t0: primeira mudança
+    t0 = df.loc[df["mudou_perfil"], [id_col, time_col]].groupby(id_col)[time_col].min().reset_index()
+    t0 = t0.rename(columns={time_col: "t0"})
+    panel = df.merge(t0, on=id_col, how="left")
+
+    # Event time k em meses: (mês atual - mês t0)
+    # Usando Year*12 + Month para diferença de meses
+    panel["Ym"] = panel[time_col].dt.year * 12 + panel[time_col].dt.month
+    panel["Ym_t0"] = panel["t0"].dt.year * 12 + panel["t0"].dt.month
+    panel["event_time"] = panel["Ym"] - panel["Ym_t0"]
+
+    # Mantém apenas clientes tratados (t0 não nulo) e k na janela
+    panel = panel[panel["t0"].notna()].copy()
+    kmin, kmax = k_window
+    panel = panel[(panel["event_time"] >= kmin) & (panel["event_time"] <= kmax)]
+
+    # Cria referência de calendário (time FE)
+    panel["mes_ref"] = panel[time_col].dt.to_period("M").astype(str)
+
+    # Mantém colunas relevantes
+    keep = [id_col, time_col, "mes_ref", perfil_col, "event_time"] + outcomes
+    keep = [c for c in keep if c in panel.columns]
+    panel = panel[keep].copy()
+
+    # Remove linhas sem outcomes
+    for oc in outcomes:
+        panel = panel[panel[oc].notna()]
+
+    return panel
+
+panel = build_event_study_panel(df_all, outcomes=OUTCOMES_FOR_CAUSAL, k_window=EVENT_WINDOW)
+logger.info(f"[OK] painel causal: {panel.shape}")
+
+# =========================
+# 9) Event Study / DiD com Efeitos Fixos
+# =========================
+def run_event_study(panel: pd.DataFrame, outcome_col: str, baseline_k=BASELINE_K):
+    """
+    Estima coeficientes de k (event_time) com FE de cliente e de tempo-calendário.
+    Usa statsmodels se disponível; caso contrário, fallback simples por média condicional.
+    """
+    df = panel.copy()
+    df = df[df["event_time"].notna()]
+    df["event_time"] = df["event_time"].astype(int)
+
+    # Define baseline
+    df = df[(df["event_time"] != 0) | (baseline_k == 0) | (True)]  # apenas garante tipo int; baseline será referência
+
+    if _HAVE_STATSMODELS:
+        df["event_time_cat"] = df["event_time"].astype(int)
+        # Tratamento com baseline explícito
+        # Nota: Treatment(baseline_k) define o nível de referência
+        formula = f"{outcome_col} ~ C(event_time_cat, Treatment({baseline_k})) + C({CLIENTE_ID_COL}) + C(mes_ref)"
+        model = smf.ols(formula=formula, data=df).fit(cov_type="HC1")
+
+        # Extrai coeficientes dos dummies de k
+        params = model.params
+        conf = model.conf_int()
+        rows = []
+        for name, coef in params.items():
+            if name.startswith("C(event_time_cat)[T."):
+                # nome no formato C(event_time_cat)[T.k]
+                k = int(name.split("[T.")[1].split("]")[0])
+                lo, hi = conf.loc[name]
+                rows.append({"k": k, "coef": float(coef), "ci_low": float(lo), "ci_high": float(hi)})
+        est = pd.DataFrame(rows).sort_values("k")
+        return est, model
+    else:
+        # Fallback: média por k - média baseline (sem FE). Didático, não substitui o modelo.
+        base = df[df["event_time"] == baseline_k][outcome_col].mean()
+        tab = df.groupby("event_time")[outcome_col].mean().reset_index()
+        tab["coef"] = tab[outcome_col] - base
+        tab["ci_low"] = np.nan
+        tab["ci_high"] = np.nan
+        est = tab.rename(columns={"event_time": "k"})[["k", "coef", "ci_low", "ci_high"]]
+        return est.sort_values("k"), None
+
+def plot_event_study(est: pd.DataFrame, title: str):
+    import matplotlib.pyplot as plt
+    fig = plt.figure(figsize=(8,4))
+    plt.axhline(0, linestyle="--")
+    plt.plot(est["k"], est["coef"], marker="o")
+    if est["ci_low"].notna().any():
+        plt.fill_between(est["k"], est["ci_low"], est["ci_high"], alpha=0.2)
+    plt.title(title)
+    plt.xlabel("k (meses relativos à mudança de perfil)")
+    plt.ylabel("Efeito estimado")
+    plt.show()
+
+# Roda Event Study para cada outcome definido
+event_results = {}
+for oc in OUTCOMES_FOR_CAUSAL:
+    est, model = run_event_study(panel, outcome_col=oc, baseline_k=BASELINE_K)
+    event_results[oc] = {"estimates": est, "model": model}
+    # Plot
+    try:
+        plot_event_study(est, f"Event Study — Outcome: {oc} (baseline k={BASELINE_K})")
+    except Exception as e:
+        logger.warning(f"[plot] Falhou ao plotar {oc}: {e}")
+
+# =========================
+# 10) Uplift/Heterogeneidade de Efeito (opcional)
+# =========================
+def build_uplift_table(panel: pd.DataFrame, outcome_col: str, k_pre=(-4, -1), k_pos=(0, 3)):
+    """
+    Calcula delta médio pós - pré mudança por cliente (janelas k_pre e k_pos) como alvo para um modelo de uplift.
+    """
+    df = panel.copy()
+    pre = df[(df["event_time"] >= k_pre[0]) & (df["event_time"] <= k_pre[1])].groupby(CLIENTE_ID_COL)[outcome_col].mean()
+    pos = df[(df["event_time"] >= k_pos[0]) & (df["event_time"] <= k_pos[1])].groupby(CLIENTE_ID_COL)[outcome_col].mean()
+    delta = (pos - pre).dropna().reset_index().rename(columns={outcome_col: "delta_outcome"})
+    return delta
+
+def run_uplift_model(df_all: pd.DataFrame, panel: pd.DataFrame, outcome_col: str):
+    """
+    Exemplo simples: RandomForestRegressor prevê delta do outcome usando features pré-tratamento
+    (probabilidades de perfil e métricas da janela baseline k=-1).
+    """
+    # baseline k=-1
+    base = panel[panel["event_time"] == BASELINE_K][[CLIENTE_ID_COL] + OUTCOMES_FOR_CAUSAL + [c for c in panel.columns if c.startswith("prob_")]]
+    base = base.drop_duplicates(CLIENTE_ID_COL)
+    delta = build_uplift_table(panel, outcome_col=outcome_col)
+
+    df_u = delta.merge(base, on=CLIENTE_ID_COL, how="left").dropna()
+    if df_u.empty:
+        logger.warning("[UPLIFT] Tabela vazia; verifique janelas e dados.")
+        return None, None
+
+    y = df_u["delta_outcome"].values
+    X = df_u.drop(columns=[CLIENTE_ID_COL, "delta_outcome"])
+    if X.empty:
+        logger.warning("[UPLIFT] Sem features; abortando.")
+        return None, None
+
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.25, random_state=42)
+    reg = RandomForestRegressor(n_estimators=300, random_state=42)
+    reg.fit(X_train, y_train)
+    r2 = reg.score(X_test, y_test)
+    logger.info(f"[UPLIFT] R2 (holdout) para delta({outcome_col}): {round(float(r2), 3)}")
+
+    # Top perfis com maior uplift previsto
+    preds = reg.predict(X_test)
+    top = pd.DataFrame({
+        CLIENTE_ID_COL: df_u.iloc[X_test.index][CLIENTE_ID_COL].values,
+        "delta_true": y_test,
+        "delta_pred": preds
+    }).sort_values("delta_pred", ascending=False).head(10)
+
+    logger.info("[UPLIFT] Top 10 clientes com maior uplift previsto:")
+    logger.info(top.to_string(index=False))
+
+    return reg, top
+
+uplift_models = {}
+for oc in OUTCOMES_FOR_CAUSAL:
+    model, top = run_uplift_model(df_all, panel, outcome_col=oc)
+    uplift_models[oc] = {"model": model, "top": top}
+
+# =========================
+# 11) Salvamento Opcional
+# =========================
+# save_outputs_to_parquet(df_all, df_stability, df_final, path="/dbfs/mnt/perfis/case5_output")
+
+print("✅ Case 5 finalizado: painel causal construído, Event Study estimado e uplift (opcional) calculado.")
